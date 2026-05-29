@@ -1,0 +1,66 @@
+{
+  "mcpServers": {
+    "sap-devs-cli": {
+      "type": "stdio",
+      "command": "sap-devs",
+      "args": ["mcp", "serve"],
+      "disabled": false,
+      "description": "Official SAP Developers CLI with comprehensive MCP tools"
+    },
+    "abap-accelerator": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@sap-samples/abap-accelerator", "serve"],
+      "disabled": false,
+      "description": "ABAP development accelerator with 150+ MCP tools"
+    },
+    "sap-adt-connector": {
+      "type": "stdio",
+      "command": "sap-adt-cli",
+      "args": ["--mcp-mode"],
+      "disabled": false,
+      "description": "SAP ABAP Development Tools connector"
+    }
+  },
+  "agents": {
+    "sap-abap-accelerator": {
+      "enabled": true,
+      "description": "Primary ABAP development agent",
+      "skills": [
+        "abap-code-generation",
+        "function-module-builder",
+        "class-designer",
+        "report-creator",
+        "dictionary-manager",
+        "transport-handler"
+      ]
+    },
+    "sap-odata-builder": {
+      "enabled": true,
+      "description": "OData and REST API development"
+    },
+    "sap-fiori-developer": {
+      "enabled": true,
+      "description": "UI5/Fiori application development"
+    },
+    "sap-btp-cloud": {
+      "enabled": true,
+      "description": "SAP Business Technology Platform development"
+    },
+    "sap-transport-manager": {
+      "enabled": true,
+      "description": "Change and transport management"
+    },
+    "sap-test-automation": {
+      "enabled": true,
+      "description": "Testing and quality assurance"
+    }
+  },
+  "environment": {
+    "ABAP_TOOLS_ENABLED": "true",
+    "SAP_SYSTEM_TYPE": "S/4HANA",
+    "CODE_GENERATION_STYLE": "modern-abap",
+    "TRANSPORT_LAYER_ENABLED": "true",
+    "SECURITY_CHECKS_ENABLED": "true"
+  }
+}
