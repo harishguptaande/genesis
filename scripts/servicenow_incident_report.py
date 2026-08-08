@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""ServiceNow open-incident scraper and Andersons-branded HTML/Excel reporter.
+"""ServiceNow open-incident scraper and Project Genesis branded reporter.
 
 Scrapes the SN - Corporate Solutions incident list from ServiceNow (Playwright,
-interactive login), filters out Resolved rows, sorts by priority, and writes:
+interactive login), filters out Resolved rows, sorts by priority (On Hold last),
+and writes:
 
   - Excel (.xlsx)
   - Self-contained HTML report (Outlook-paste friendly)
+  - 16:9 executive dashboard HTML
+  - PowerPoint summary slide (.pptx, optional via python-pptx)
 
 Usage:
   pip install -r requirements-snow.txt
   playwright install chromium
   python scripts/servicenow_incident_report.py
-
-Optional environment overrides:
-  SNOW_OUTPUT_DIR   Directory for Excel/HTML output (default: /home/ANDE/SNOW)
-  SNOW_LOGO_PATH    Path to Andersons logo image for the HTML header
 """
 
 from __future__ import annotations
 
-import base64
 import html as html_lib
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -29,7 +26,7 @@ from typing import Iterable
 import pandas as pd
 from playwright.sync_api import Frame, Page, TimeoutError, sync_playwright
 
-OUTPUT_DIR = Path(os.environ.get("SNOW_OUTPUT_DIR", "/home/ANDE/SNOW"))
+OUTPUT_DIR = Path("/home/ANDE/SNOW")
 FALLBACK_OUTPUT_DIR = Path.home() / "SNOW"
 URL = (
     "https://andersonsinc.service-now.com/now/nav/ui/classic/params/target/"
@@ -41,16 +38,12 @@ URL = (
 LOGIN_TIMEOUT_MS = 300_000
 PAGE_LOAD_WAIT_MS = 10_000
 
-# --- Andersons / TCS branding ---
+# --- Project Genesis / TCS branding ---
 ANDE_BLUE = "#002D5B"
 ANDE_GOLD = "#FFB432"
 ANDE_CREAM = "#FAF8F4"
-# Optional: point this at a local Andersons logo (png/jpg/svg). If the file
-# exists it is base64-embedded into the HTML; otherwise a styled text
-# wordmark is rendered so the report never breaks.
-LOGO_PATH = Path(
-    os.environ.get("SNOW_LOGO_PATH", "/home/harishgupta/ANDE/andersons_logo.png")
-)
+# Program wordmark shown in place of a logo on all report headers.
+PROGRAM_NAME = "Project Genesis"
 
 PRIORITY_COLORS = {
     1: ("#C00000", "#FDECEC"),  # Critical  - red
@@ -354,16 +347,17 @@ def find_column(columns: Iterable[str], *candidates: str) -> str | None:
 
 
 def drop_placeholder_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove decoration columns (checkbox/preview) from the output entirely:
-    any column that is all-empty, and any Column_N placeholder that carries
-    no meaningful data."""
+    """Remove ServiceNow decoration columns from the output entirely:
+    every Column_N placeholder (unlabeled columns - row selection checkbox,
+    preview icon) regardless of content, plus any column that is all-empty."""
     if df.empty:
         return df
     keep = []
     for col in df.columns:
+        if str(col).startswith("Column_"):
+            continue
         values = df[col].astype(str).str.strip()
-        all_empty = values.eq("").all()
-        if all_empty:
+        if values.eq("").all():
             continue
         keep.append(col)
     return df[keep]
@@ -415,6 +409,15 @@ def filter_and_sort_records(records: list[dict[str, str]]) -> pd.DataFrame:
     if state_col is not None:
         df = df[~df[state_col].astype(str).str.strip().str.upper().eq("RESOLVED")]
 
+    sort_cols: list[str] = []
+
+    # On Hold items go LAST regardless of priority (least importance).
+    if state_col is not None:
+        df["__onhold"] = (
+            df[state_col].astype(str).str.strip().str.lower().eq("on hold").astype(int)
+        )
+        sort_cols.append("__onhold")
+
     if priority_col is not None:
         df["__priority_rank"] = (
             df[priority_col]
@@ -424,8 +427,12 @@ def filter_and_sort_records(records: list[dict[str, str]]) -> pd.DataFrame:
             .map(PRIORITY_RANK)
             .fillna(999)
         )
-        df = df.sort_values(by=["__priority_rank", priority_col], ascending=[True, True])
-        df = df.drop(columns=["__priority_rank"])
+        sort_cols.append("__priority_rank")
+        sort_cols.append(priority_col)
+
+    if sort_cols:
+        df = df.sort_values(by=sort_cols, ascending=True, kind="stable")
+        df = df.drop(columns=[c for c in ["__onhold", "__priority_rank"] if c in df.columns])
 
     df = drop_placeholder_columns(df)
     df = df.reset_index(drop=True)
@@ -436,29 +443,19 @@ def priority_rank_of(value: str) -> int | None:
     return PRIORITY_RANK.get(str(value).strip().lower())
 
 
-def build_logo_html() -> str:
-    """Base64-embed the Andersons logo if available; else a styled wordmark."""
-    if LOGO_PATH.is_file():
-        try:
-            data = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
-            suffix = LOGO_PATH.suffix.lower().lstrip(".")
-            mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "gif": "image/gif", "svg": "image/svg+xml"}.get(suffix, "image/png")
-            return (
-                f'<img src="data:{mime};base64,{data}" alt="The Andersons" '
-                f'style="height:48px;vertical-align:middle;" />'
-            )
-        except OSError:
-            pass
+def build_wordmark_html(font_px: int = 26) -> str:
+    """Project Genesis wordmark in Andersons brand colors (no external image,
+    so the header always renders identically in email, browser, and print)."""
     return (
-        f'<span style="font-family:Georgia,serif;font-size:26px;font-weight:bold;'
-        f'color:{ANDE_BLUE};vertical-align:middle;">The Andersons'
-        f'<span style="color:{ANDE_GOLD};">&#9650;</span></span>'
+        f'<span style="font-family:Calibri,Arial,sans-serif;font-size:{font_px}px;'
+        f'font-weight:bold;color:{ANDE_BLUE};letter-spacing:0.5px;'
+        f'vertical-align:middle;">{PROGRAM_NAME}'
+        f'<span style="color:{ANDE_GOLD};">.</span></span>'
     )
 
 
 def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
-    """Self-contained HTML report in Andersons branding. Pure inline CSS,
+    """Self-contained HTML report in Project Genesis branding. Pure inline CSS,
     no JavaScript/CDN, so it can be pasted into Outlook (Cmd+A, Cmd+C)."""
     generated = datetime.now().strftime("%B %d, %Y %I:%M %p")
 
@@ -509,9 +506,14 @@ def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
             for col in df.columns
         )
         body_rows = ""
+        state_col_report = find_column(df.columns, "State", "Status")
         for i, (_, row) in enumerate(df.iterrows()):
             rank = priority_rank_of(row[priority_col]) if priority_col is not None else None
-            zebra = "#FFFFFF" if i % 2 == 0 else ANDE_CREAM
+            is_onhold = (
+                state_col_report is not None
+                and str(row[state_col_report]).strip().lower() == "on hold"
+            )
+            zebra = "#F1EEE8" if is_onhold else ("#FFFFFF" if i % 2 == 0 else ANDE_CREAM)
             cells = ""
             for col in df.columns:
                 value = html_lib.escape(str(row[col]))
@@ -519,11 +521,16 @@ def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
                     'padding:7px 10px;font-size:12px;color:#333333;'
                     'border-bottom:1px solid #E3DED6;vertical-align:top;'
                 )
+                if is_onhold:
+                    style += 'color:#777777;'
                 if col == priority_col and rank in PRIORITY_COLORS:
                     fg, bg = PRIORITY_COLORS[rank]
-                    style += (
-                        f'color:{fg};background:{bg};font-weight:bold;white-space:nowrap;'
-                    )
+                    if is_onhold:
+                        style += f'color:{fg};opacity:0.55;font-weight:bold;white-space:nowrap;'
+                    else:
+                        style += (
+                            f'color:{fg};background:{bg};font-weight:bold;white-space:nowrap;'
+                        )
                 cells += f'<td style="{style}">{value}</td>'
             body_rows += f'<tr style="background:{zebra};">{cells}</tr>'
         table_html = (
@@ -543,7 +550,7 @@ def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
 <tr><td style="padding:24px 28px 0 28px;">
   <table cellpadding="0" cellspacing="0" style="width:100%;">
   <tr>
-    <td style="vertical-align:middle;">{build_logo_html()}</td>
+    <td style="vertical-align:middle;">{build_wordmark_html(26)}</td>
     <td style="text-align:right;vertical-align:middle;font-family:Calibri,Arial,sans-serif;
         font-size:12px;color:{ANDE_BLUE};">Generated: {generated}</td>
   </tr>
@@ -567,7 +574,7 @@ def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
       color:{ANDE_BLUE};font-family:Calibri,Arial,sans-serif;">
     <b>Harish Gupta</b> | Enterprise Solutions Unit &mdash; Consulting Practice |
     gupta.h@tcs.com<br/>
-    <span style="color:#777777;">TCS / The Andersons Confidential &mdash;
+    <span style="color:#777777;">TCS / Project Genesis Confidential &mdash;
     Source: ServiceNow incident list extract</span>
   </div>
 </td></tr>
@@ -576,6 +583,409 @@ def write_html_report(df: pd.DataFrame, output_file: Path) -> None:
 </html>"""
 
     output_file.write_text(html_doc, encoding="utf-8")
+
+
+def write_dashboard_html(df: pd.DataFrame, output_file: Path) -> None:
+    """Executive dashboard sized 16:9 (1280x720) as a single slide.
+    Pure inline CSS, no JavaScript - copy/paste or screenshot into PowerPoint."""
+    generated = datetime.now().strftime("%B %d, %Y")
+    priority_col = find_column(df.columns, "Priority")
+    state_col = find_column(df.columns, "State", "Status")
+    assigned_col = find_column(df.columns, "Assigned To", "Assigned to")
+    number_col = find_column(df.columns, "Number", "Task number")
+    desc_col = find_column(df.columns, "Short Description", "Short description")
+
+    total = len(df)
+    counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    if priority_col is not None:
+        for value in df[priority_col]:
+            rank = priority_rank_of(value)
+            if rank in counts:
+                counts[rank] += 1
+    if state_col is not None and not df.empty:
+        onhold_mask = df[state_col].astype(str).str.strip().str.lower().eq("on hold")
+    else:
+        onhold_mask = pd.Series([False] * len(df), index=df.index, dtype=bool)
+    onhold_count = int(onhold_mask.sum())
+
+    def kpi(value, label, fg, bg):
+        return (
+            f'<td style="width:16%;background:{bg};border:1px solid {fg};'
+            f'border-radius:8px;padding:12px 6px;text-align:center;">'
+            f'<div style="font-size:34px;font-weight:bold;color:{fg};line-height:1;">{value}</div>'
+            f'<div style="font-size:11px;color:{ANDE_BLUE};text-transform:uppercase;'
+            f'letter-spacing:1px;margin-top:5px;">{label}</div></td><td style="width:8px;"></td>'
+        )
+
+    kpis = kpi(total, "Total Open", ANDE_BLUE, "#FFFFFF")
+    for rank, label in [(1, "Critical"), (2, "High"), (3, "Medium"), (4, "Low")]:
+        fg, bg = PRIORITY_COLORS[rank]
+        kpis += kpi(counts[rank], label, fg, bg)
+    kpis += kpi(onhold_count, "On Hold", "#777777", "#F1EEE8")
+
+    attention_rows = ""
+    if not df.empty and number_col is not None:
+        active = df[~onhold_mask].head(6)
+        for _, row in active.iterrows():
+            rank = priority_rank_of(row[priority_col]) if priority_col is not None else None
+            fg, bg = PRIORITY_COLORS.get(rank, (ANDE_BLUE, "#FFFFFF"))
+            desc = str(row[desc_col]) if desc_col is not None else ""
+            if len(desc) > 58:
+                desc = desc[:55] + "..."
+            assignee = str(row[assigned_col]) if assigned_col is not None else ""
+            if not assignee.strip():
+                assignee = "UNASSIGNED"
+            attention_rows += (
+                f'<tr>'
+                f'<td style="padding:5px 8px;font-size:12px;font-weight:bold;'
+                f'color:{ANDE_BLUE};white-space:nowrap;border-bottom:1px solid #E3DED6;">'
+                f'{html_lib.escape(str(row[number_col]))}</td>'
+                f'<td style="padding:5px 4px;border-bottom:1px solid #E3DED6;white-space:nowrap;">'
+                f'<span style="background:{bg};color:{fg};font-size:10px;font-weight:bold;'
+                f'padding:2px 7px;border-radius:8px;border:1px solid {fg};">'
+                f'{html_lib.escape(str(row[priority_col]) if priority_col else "")}</span></td>'
+                f'<td style="padding:5px 8px;font-size:11.5px;color:#333333;'
+                f'border-bottom:1px solid #E3DED6;">{html_lib.escape(desc)}</td>'
+                f'<td style="padding:5px 8px;font-size:11.5px;color:{ANDE_BLUE};'
+                f'white-space:nowrap;border-bottom:1px solid #E3DED6;">'
+                f'{html_lib.escape(assignee)}</td></tr>'
+            )
+
+    assignee_bars = ""
+    if assigned_col is not None and not df.empty:
+        workload = (
+            df[assigned_col].astype(str).str.strip().replace("", "UNASSIGNED")
+            .value_counts().head(7)
+        )
+        max_count = int(workload.max()) if len(workload) else 1
+        for name, count in workload.items():
+            width_pct = max(8, int(count / max_count * 100))
+            assignee_bars += (
+                f'<tr><td style="padding:3px 8px 3px 0;font-size:11.5px;color:#333333;'
+                f'white-space:nowrap;width:140px;">{html_lib.escape(str(name))}</td>'
+                f'<td style="padding:3px 0;"><div style="background:{ANDE_BLUE};'
+                f'height:14px;width:{width_pct}%;border-radius:2px;"></div></td>'
+                f'<td style="padding:3px 0 3px 8px;font-size:11.5px;font-weight:bold;'
+                f'color:{ANDE_BLUE};width:24px;">{count}</td></tr>'
+            )
+
+    state_chips = ""
+    if state_col is not None and not df.empty:
+        for state, count in df[state_col].astype(str).str.strip().value_counts().items():
+            is_hold = state.lower() == "on hold"
+            chip_fg = "#777777" if is_hold else ANDE_BLUE
+            chip_bg = "#F1EEE8" if is_hold else "#FFFFFF"
+            state_chips += (
+                f'<span style="display:inline-block;background:{chip_bg};color:{chip_fg};'
+                f'border:1px solid {chip_fg};border-radius:10px;padding:3px 10px;'
+                f'font-size:11px;margin:0 6px 6px 0;">{html_lib.escape(state)} '
+                f'<b>{count}</b></span>'
+            )
+
+    # ON HOLD strip (bottom of slide): parked items, dimmed, two columns
+    MAX_ONHOLD_SHOWN = 6
+    onhold_cells = ""
+    onhold_more = ""
+    if onhold_count > 0 and number_col is not None:
+        onhold_df = df[onhold_mask]
+        shown = onhold_df.head(MAX_ONHOLD_SHOWN)
+        items = []
+        for _, row in shown.iterrows():
+            desc = str(row[desc_col]) if desc_col is not None else ""
+            if len(desc) > 44:
+                desc = desc[:41] + "..."
+            assignee = str(row[assigned_col]).strip() if assigned_col is not None else ""
+            if not assignee:
+                assignee = "UNASSIGNED"
+            prio = str(row[priority_col]) if priority_col is not None else ""
+            items.append(
+                f'<td style="width:50%;padding:3px 10px 3px 0;font-size:11px;color:#777777;'
+                f'border-bottom:1px dotted #D8D2C8;white-space:nowrap;overflow:hidden;">'
+                f'<b style="color:#555555;">{html_lib.escape(str(row[number_col]))}</b>'
+                f' &nbsp;<span style="font-size:10px;border:1px solid #AAAAAA;border-radius:8px;'
+                f'padding:1px 6px;">{html_lib.escape(prio)}</span>'
+                f' &nbsp;{html_lib.escape(desc)}'
+                f' &nbsp;&mdash;&nbsp;<i>{html_lib.escape(assignee)}</i></td>'
+            )
+        rows_html = ""
+        for i in range(0, len(items), 2):
+            pair = items[i] + (items[i + 1] if i + 1 < len(items) else '<td style="width:50%;"></td>')
+            rows_html = rows_html + "<tr>" + pair + "</tr>"
+        onhold_cells = rows_html
+        remaining = onhold_count - len(shown)
+        if remaining > 0:
+            onhold_more = (
+                f'<span style="font-size:11px;color:#999999;">+ {remaining} more on hold '
+                f'(see detailed report)</span>'
+            )
+
+    html_doc = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /><title>Executive Summary - ServiceNow Incidents</title></head>
+<body style="margin:0;padding:0;background:#888888;font-family:Calibri,Arial,sans-serif;">
+<div style="width:1280px;height:720px;background:{ANDE_CREAM};margin:0 auto;
+     position:relative;overflow:hidden;box-sizing:border-box;padding:26px 34px;">
+
+  <table cellpadding="0" cellspacing="0" style="width:100%;">
+  <tr>
+    <td style="vertical-align:middle;width:230px;">{build_wordmark_html(28)}</td>
+    <td style="vertical-align:middle;padding-left:20px;border-left:3px solid {ANDE_GOLD};">
+      <div style="font-size:23px;font-weight:bold;color:{ANDE_BLUE};line-height:1.1;">
+        ServiceNow Incidents &mdash; Executive Summary</div>
+      <div style="font-size:12px;color:#555555;margin-top:2px;">
+        SN - Corporate Solutions &nbsp;|&nbsp; Open incidents (excl. Resolved) &nbsp;|&nbsp; {generated}</div>
+    </td>
+    <td style="text-align:right;vertical-align:middle;font-size:11px;color:{ANDE_BLUE};">
+      TCS / Project Genesis<br/>Confidential</td>
+  </tr>
+  </table>
+  <div style="border-bottom:3px solid {ANDE_GOLD};margin:12px 0 16px 0;"></div>
+
+  <table cellpadding="0" cellspacing="0" style="width:100%;"><tr>{kpis}</tr></table>
+
+  <table cellpadding="0" cellspacing="0" style="width:100%;margin-top:18px;">
+  <tr>
+    <td style="width:58%;vertical-align:top;padding-right:22px;">
+      <div style="font-size:14px;font-weight:bold;color:{ANDE_BLUE};
+           border-bottom:2px solid {ANDE_GOLD};padding-bottom:4px;margin-bottom:6px;">
+        NEEDS ATTENTION &mdash; TOP ACTIVE INCIDENTS</div>
+      <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+        {attention_rows if attention_rows else '<tr><td style="font-size:12px;color:#555;">No active incidents.</td></tr>'}
+      </table>
+    </td>
+    <td style="width:42%;vertical-align:top;">
+      <div style="font-size:14px;font-weight:bold;color:{ANDE_BLUE};
+           border-bottom:2px solid {ANDE_GOLD};padding-bottom:4px;margin-bottom:6px;">
+        OPEN WORKLOAD BY ASSIGNEE</div>
+      <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
+        {assignee_bars if assignee_bars else '<tr><td style="font-size:12px;color:#555;">No data.</td></tr>'}
+      </table>
+      <div style="font-size:14px;font-weight:bold;color:{ANDE_BLUE};
+           border-bottom:2px solid {ANDE_GOLD};padding-bottom:4px;
+           margin:14px 0 8px 0;">BY STATE</div>
+      <div>{state_chips if state_chips else '<span style="font-size:12px;color:#555;">No data.</span>'}</div>
+    </td>
+  </tr>
+  </table>
+
+  <div style="margin-top:14px;">
+    <div style="font-size:13px;font-weight:bold;color:#777777;
+         border-bottom:2px solid {ANDE_GOLD};padding-bottom:3px;margin-bottom:4px;">
+      ON HOLD &mdash; PARKED ITEMS (RANKED LAST)
+      &nbsp;<span style="font-weight:normal;font-size:11px;color:#999999;">{onhold_count} total</span>
+      &nbsp;{onhold_more}</div>
+    <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;table-layout:fixed;">
+      {onhold_cells if onhold_cells else '<tr><td style="font-size:11px;color:#999999;padding:3px 0;">None - no incidents currently on hold.</td></tr>'}
+    </table>
+  </div>
+
+  <div style="position:absolute;bottom:16px;left:34px;right:34px;
+       border-top:2px solid {ANDE_GOLD};padding-top:7px;font-size:10.5px;color:{ANDE_BLUE};">
+    <b>Harish Gupta</b> | Enterprise Solutions Unit &mdash; Consulting Practice | gupta.h@tcs.com
+    <span style="float:right;color:#777777;">On Hold items ranked last regardless of priority
+    &nbsp;&bull;&nbsp; Source: ServiceNow incident list extract</span>
+  </div>
+</div>
+</body>
+</html>"""
+    output_file.write_text(html_doc, encoding="utf-8")
+
+
+def write_pptx_slide(df: pd.DataFrame, output_file: Path) -> bool:
+    """Native single-slide PowerPoint version of the executive dashboard.
+    Returns False (with a console note) if python-pptx is not installed."""
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt, Emu
+        from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN
+    except ImportError:
+        print("Note: python-pptx not installed - skipping .pptx slide. Install with: pip install python-pptx")
+        return False
+
+    BLUE = RGBColor(0x00, 0x2D, 0x5B)
+    GOLD = RGBColor(0xFF, 0xB4, 0x32)
+    CREAM = RGBColor(0xFA, 0xF8, 0xF4)
+    GRAY = RGBColor(0x77, 0x77, 0x77)
+    WHITE = RGBColor(0xFF, 0xFF, 0xFF)
+    DARK = RGBColor(0x33, 0x33, 0x33)
+    PRIO_RGB = {1: RGBColor(0xC0, 0x00, 0x00), 2: RGBColor(0xC5, 0x5A, 0x11),
+                3: RGBColor(0xBF, 0x8F, 0x00), 4: RGBColor(0x54, 0x82, 0x35),
+                5: RGBColor(0x2E, 0x75, 0xB6)}
+
+    priority_col = find_column(df.columns, "Priority")
+    state_col = find_column(df.columns, "State", "Status")
+    assigned_col = find_column(df.columns, "Assigned To", "Assigned to")
+    number_col = find_column(df.columns, "Number", "Task number")
+    desc_col = find_column(df.columns, "Short Description", "Short description")
+
+    total = len(df)
+    counts = {1: 0, 2: 0, 3: 0, 4: 0}
+    if priority_col is not None:
+        for value in df[priority_col]:
+            rank = priority_rank_of(value)
+            if rank in counts:
+                counts[rank] += 1
+    if state_col is not None and not df.empty:
+        onhold_mask = df[state_col].astype(str).str.strip().str.lower().eq("on hold")
+    else:
+        onhold_mask = pd.Series([False] * len(df), index=df.index, dtype=bool)
+    onhold_count = int(onhold_mask.sum())
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+    bg = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
+    bg.fill.solid(); bg.fill.fore_color.rgb = CREAM; bg.line.fill.background()
+    bg.shadow.inherit = False
+
+    def textbox(left, top, width, height, text, size, color, bold=False, align=PP_ALIGN.LEFT):
+        box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+        tf = box.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = color
+        run.font.name = "Calibri"
+        return box
+
+    textbox(0.45, 0.30, 3.3, 0.6, PROGRAM_NAME, 24, BLUE, bold=True)
+    textbox(3.9, 0.26, 8.0, 0.5, "ServiceNow Incidents - Executive Summary", 24, BLUE, bold=True)
+    textbox(3.9, 0.74, 8.0, 0.35,
+            f"SN - Corporate Solutions  |  Open incidents (excl. Resolved)  |  "
+            f"{datetime.now():%B %d, %Y}", 11, GRAY)
+    rule = slide.shapes.add_shape(1, Inches(0.45), Inches(1.18), Inches(12.45), Emu(38100))
+    rule.fill.solid(); rule.fill.fore_color.rgb = GOLD; rule.line.fill.background()
+    rule.shadow.inherit = False
+
+    kpi_specs = [
+        (str(total), "TOTAL OPEN", BLUE),
+        (str(counts[1]), "CRITICAL", PRIO_RGB[1]),
+        (str(counts[2]), "HIGH", PRIO_RGB[2]),
+        (str(counts[3]), "MEDIUM", PRIO_RGB[3]),
+        (str(counts[4]), "LOW", PRIO_RGB[4]),
+        (str(onhold_count), "ON HOLD", GRAY),
+    ]
+    box_w, gap, left0 = 1.95, 0.15, 0.45
+    for i, (value, label, color) in enumerate(kpi_specs):
+        left = left0 + i * (box_w + gap)
+        shape = slide.shapes.add_shape(5, Inches(left), Inches(1.45), Inches(box_w), Inches(1.15))
+        shape.fill.solid(); shape.fill.fore_color.rgb = WHITE
+        shape.line.color.rgb = color
+        shape.line.width = Pt(1.5)
+        shape.shadow.inherit = False
+        tf = shape.text_frame
+        tf.word_wrap = True
+        p1 = tf.paragraphs[0]; p1.alignment = PP_ALIGN.CENTER
+        r1 = p1.add_run(); r1.text = value
+        r1.font.size = Pt(30); r1.font.bold = True; r1.font.color.rgb = color
+        p2 = tf.add_paragraph(); p2.alignment = PP_ALIGN.CENTER
+        r2 = p2.add_run(); r2.text = label
+        r2.font.size = Pt(10); r2.font.color.rgb = BLUE
+
+    textbox(0.45, 2.85, 7.4, 0.35, "NEEDS ATTENTION - TOP ACTIVE INCIDENTS", 13, BLUE, bold=True)
+    active = df[~onhold_mask].head(6) if not df.empty else df
+    n_rows = max(1, len(active)) + 1
+    table_shape = slide.shapes.add_table(
+        n_rows, 4, Inches(0.45), Inches(3.25), Inches(7.4), Inches(0.32 * n_rows)
+    )
+    table = table_shape.table
+    table.columns[0].width = Inches(1.35)
+    table.columns[1].width = Inches(1.15)
+    table.columns[2].width = Inches(3.35)
+    table.columns[3].width = Inches(1.55)
+    for c, header in enumerate(["Number", "Priority", "Short Description", "Assigned To"]):
+        cell = table.cell(0, c)
+        cell.fill.solid(); cell.fill.fore_color.rgb = BLUE
+        p = cell.text_frame.paragraphs[0]
+        run = p.add_run(); run.text = header
+        run.font.size = Pt(10); run.font.bold = True; run.font.color.rgb = WHITE
+    for r, (_, row) in enumerate(active.iterrows(), start=1):
+        rank = priority_rank_of(row[priority_col]) if priority_col is not None else None
+        desc = str(row[desc_col]) if desc_col is not None else ""
+        if len(desc) > 52:
+            desc = desc[:49] + "..."
+        assignee = str(row[assigned_col]).strip() if assigned_col is not None else ""
+        cells = [
+            str(row[number_col]) if number_col is not None else "",
+            str(row[priority_col]) if priority_col is not None else "",
+            desc,
+            assignee if assignee else "UNASSIGNED",
+        ]
+        for c, value in enumerate(cells):
+            cell = table.cell(r, c)
+            cell.fill.solid()
+            cell.fill.fore_color.rgb = WHITE if r % 2 else CREAM
+            p = cell.text_frame.paragraphs[0]
+            run = p.add_run(); run.text = value
+            run.font.size = Pt(9.5)
+            run.font.color.rgb = PRIO_RGB.get(rank, BLUE) if c == 1 else DARK
+            run.font.bold = c in (0, 1)
+
+    textbox(8.15, 2.85, 4.7, 0.35, "OPEN WORKLOAD BY ASSIGNEE", 13, BLUE, bold=True)
+    if assigned_col is not None and not df.empty:
+        workload = (
+            df[assigned_col].astype(str).str.strip().replace("", "UNASSIGNED")
+            .value_counts().head(7)
+        )
+        max_count = int(workload.max()) if len(workload) else 1
+        top = 3.30
+        for name, count in workload.items():
+            textbox(8.15, top, 1.9, 0.28, str(name)[:20], 9.5, DARK)
+            bar_w = max(0.25, 2.2 * count / max_count)
+            bar = slide.shapes.add_shape(1, Inches(10.1), Inches(top + 0.04),
+                                         Inches(bar_w), Inches(0.16))
+            bar.fill.solid(); bar.fill.fore_color.rgb = BLUE; bar.line.fill.background()
+            bar.shadow.inherit = False
+            textbox(10.15 + bar_w, top, 0.5, 0.28, str(count), 9.5, BLUE, bold=True)
+            top += 0.31
+
+    # ON HOLD parked items (bottom strip, dimmed)
+    MAX_ONHOLD_SHOWN = 3
+    onhold_df = df[onhold_mask] if not df.empty else df
+    header_text = f"ON HOLD — PARKED ITEMS (RANKED LAST)   |   {onhold_count} total"
+    remaining = onhold_count - min(onhold_count, MAX_ONHOLD_SHOWN)
+    if remaining > 0:
+        header_text += f"   |   + {remaining} more in detailed report"
+    textbox(0.45, 5.62, 12.4, 0.3, header_text, 11.5, GRAY, bold=True)
+    hold_rule = slide.shapes.add_shape(1, Inches(0.45), Inches(5.92), Inches(12.45), Emu(19050))
+    hold_rule.fill.solid(); hold_rule.fill.fore_color.rgb = GOLD; hold_rule.line.fill.background()
+    hold_rule.shadow.inherit = False
+    if onhold_count > 0:
+        top = 6.02
+        for _, row in onhold_df.head(MAX_ONHOLD_SHOWN).iterrows():
+            desc = str(row[desc_col]) if desc_col is not None else ""
+            if len(desc) > 70:
+                desc = desc[:67] + "..."
+            assignee = str(row[assigned_col]).strip() if assigned_col is not None else ""
+            line = (
+                f"{row[number_col] if number_col is not None else ''}   "
+                f"[{row[priority_col] if priority_col is not None else ''}]   "
+                f"{desc}   —  {assignee if assignee else 'UNASSIGNED'}"
+            )
+            textbox(0.45, top, 12.4, 0.27, line, 9, GRAY)
+            top += 0.27
+    else:
+        textbox(0.45, 6.02, 12.4, 0.27, "None - no incidents currently on hold.", 9, GRAY)
+
+    foot = slide.shapes.add_shape(1, Inches(0.45), Inches(6.92), Inches(12.45), Emu(25400))
+    foot.fill.solid(); foot.fill.fore_color.rgb = GOLD; foot.line.fill.background()
+    foot.shadow.inherit = False
+    textbox(0.45, 7.02, 8.0, 0.35,
+            "Harish Gupta | Enterprise Solutions Unit - Consulting Practice | gupta.h@tcs.com",
+            9, BLUE)
+    textbox(8.0, 7.02, 4.9, 0.35,
+            "On Hold ranked last regardless of priority  |  TCS / Project Genesis Confidential",
+            8.5, GRAY, align=PP_ALIGN.RIGHT)
+
+    prs.save(str(output_file))
+    return True
 
 
 def print_preview(df: pd.DataFrame) -> None:
@@ -635,11 +1045,23 @@ def main() -> int:
             html_file = output_file.with_suffix(".html")
             try:
                 write_html_report(filtered_df, html_file)
-                print(f"Andersons-branded HTML report saved to: {html_file.resolve()}")
-                if not LOGO_PATH.is_file():
-                    print(f"Note: logo file not found at {LOGO_PATH} - used styled text wordmark instead.")
+                print(f"Branded HTML report saved to: {html_file.resolve()}")
             except Exception as exc:
                 print(f"HTML report generation failed ({exc}). Excel output is unaffected.")
+
+            dashboard_file = output_base / (output_file.stem + "_dashboard.html")
+            try:
+                write_dashboard_html(filtered_df, dashboard_file)
+                print(f"Executive dashboard (16:9 slide) saved to: {dashboard_file.resolve()}")
+            except Exception as exc:
+                print(f"Dashboard generation failed ({exc}). Other outputs are unaffected.")
+
+            pptx_file = output_base / (output_file.stem + "_summary.pptx")
+            try:
+                if write_pptx_slide(filtered_df, pptx_file):
+                    print(f"PowerPoint summary slide saved to: {pptx_file.resolve()}")
+            except Exception as exc:
+                print(f"PPTX slide generation failed ({exc}). Other outputs are unaffected.")
 
             print(f"Filtered rows exported: {len(filtered_df)}")
 
