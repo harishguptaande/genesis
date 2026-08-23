@@ -7,10 +7,3 @@ python-dotenv==1.0.0
 pytest==7.4.3
 pytest-asyncio==0.21.1
 httpx==0.25.2
-
-# SAP Development Tools
-abap-sdk==1.2.0
-sap-connector==2.1.0
-py-abap==3.0.0
-odata4py==0.5.0
-sap-cli==2.0.0
