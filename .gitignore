@@ -43,3 +43,10 @@ htmlcov/
 .DS_Store
 *.db
 *.sqlite
+
+# ServiceNow report outputs
+servicenow_incidents_*.xlsx
+servicenow_incidents_*.html
+servicenow_incidents_*_dashboard.html
+servicenow_incidents_*_summary.pptx
+**/SNOW/
